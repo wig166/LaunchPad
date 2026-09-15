@@ -3,7 +3,8 @@
 从 macOS 26 开始,系统的启动台被换成了新的「App」浏览页,交互逻辑全变了。
 这个项目就是把原来那个熟悉的启动台做回来:文件夹、拖动排序等。
 
-![顶层页](assets/screenshot-top.png)
+![顶层页]<img width="2808" height="1410" alt="image" src="https://github.com/user-attachments/assets/2ba7af37-d57e-43d0-98d6-3f36ac4e248c" />
+
 
 ## 系统要求
 
