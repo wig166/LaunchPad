@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+*/.DS_Store
+
+# 构建产物
+build/
+*.o
+swiftc_build/
+
+# 调试产物(截图带个人环境,不入库)
+诊断截图/
+
+# 编辑器
+*.swp
+.idea/
+.vscode/

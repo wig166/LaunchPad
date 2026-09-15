@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ★ 关键:固定 bundle identifier + 显式 entitlements,
+         让 macOS TCC(透明度同意与控制)识别 LaunchPad 为「同一个 app」,
+         而不是每次 codesign 都当成新 app 撤销授权。
+         缺这俩:每次 ./build.sh 都会让你重新勾辅助功能。 -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>
