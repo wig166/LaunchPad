@@ -125,10 +125,24 @@ enum WallpaperBackground {
     /// 拉到全屏会糊出马赛克,宁可多花 20ms 从原图重新生成。
     private static let minAcceptableThumbnailWidth = 320
 
+    /// 用户设置的模糊半径(0 = 完全清晰)。没设置过就是 16(历史默认值)。
+    /// 顶栏那个滑杆改的就是 UserDefaults 这个键,改完调用方重算一次即可。
+    static var userBlurRadius: CGFloat {
+        guard UserDefaults.standard.object(forKey: "wallpaper.blurRadius") != nil else { return 16 }
+        return CGFloat(max(0, min(40, UserDefaults.standard.double(forKey: "wallpaper.blurRadius"))))
+    }
+
     /// 取某块屏幕壁纸的模糊版。取不到返回 nil,调用方自行回退。
     ///
-    /// - Parameter darken: 额外压暗比例,保证白色图标名在任何壁纸上都读得清。
-    static func image(for screen: NSScreen, darken: CGFloat = 0.18) -> NSImage? {
+    /// - Parameters:
+    ///   - darken: 额外压暗比例,保证白色图标名在任何壁纸上都读得清。
+    ///   - blurRadius: 高斯模糊半径(0~40)。nil = 读用户设置
+    ///     (`UserDefaults` 键 `wallpaper.blurRadius`,没设置过就是 16)。
+    ///     顶栏那个滑杆改的就是这个值 —— 改完重算一次(缓存 key 带半径,约 20ms)。
+    static func image(for screen: NSScreen,
+                      darken: CGFloat = 0.18,
+                      blurRadius: CGFloat? = nil) -> NSImage? {
+        let radius = blurRadius ?? userBlurRadius
         migrateLegacyPollutionOnce()          // 见下方"老版本污染的善后"
 
         guard let file = locateWallpaperFile(for: screen) else {
@@ -138,8 +152,8 @@ enum WallpaperBackground {
         lastSourcePath = file.path
 
         let size = screen.frame.size
-        // 缓存 key 带源文件路径 —— 换壁纸后自动失效重算。
-        let key = "\(file.path)|\(Int(size.width))x\(Int(size.height))|\(darken)"
+        // 缓存 key 带源文件路径 + 模糊半径 —— 换壁纸或调滑杆都会失效重算。
+        let key = "\(file.path)|\(Int(size.width))x\(Int(size.height))|\(darken)|\(Int(radius))"
 
         cacheLock.lock()
         if let hit = cache[key] {
@@ -159,7 +173,7 @@ enum WallpaperBackground {
         let accessBefore = try? file.resourceValues(forKeys: [.contentAccessDateKey]).contentAccessDate
         defer { if let d = accessBefore { restoreAccessTime(of: file, to: d) } }
 
-        guard let made = render(url: file, displaySize: size, darken: darken) else { return nil }
+        guard let made = render(url: file, displaySize: size, darken: darken, blurRadius: radius) else { return nil }
 
         cacheLock.lock()
         cache[key] = made
@@ -300,7 +314,7 @@ enum WallpaperBackground {
 
     // MARK: - 渲染
 
-    private static func render(url: URL, displaySize: CGSize, darken: CGFloat) -> NSImage? {
+    private static func render(url: URL, displaySize: CGSize, darken: CGFloat, blurRadius radius: CGFloat) -> NSImage? {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
 
         // ★ 优先用文件内嵌的缩略图:相机/手机拍的图内部本来就带一张小图,
@@ -320,7 +334,10 @@ enum WallpaperBackground {
         // 放大回全屏后肉眼几乎没差别,但像素量差两个数量级。
         let blurred = small
             .clampedToExtent()
-            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 16])
+            .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: radius])
+
+        // 半径为 0 时跳过模糊也无妨 —— 但 clampedToExtent 之后裁切逻辑不变,
+        // 统一走同一条路径,少一个分支少一个坑。
 
         // ★★ 按屏幕宽高比居中裁切(cover 语义)。
         //

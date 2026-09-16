@@ -445,16 +445,43 @@ struct TopLevelView: View {
         }
     }
 
+    /// 背景模糊半径(0~40,UserDefaults 持久化)。
+    /// WallpaperBackground 那边读的是同一个键,这里改完根视图 onChange 重算背景。
+    @AppStorage("wallpaper.blurRadius") private var blurRadius: Double = 16
+    /// 模糊度调节条是否展开。
+    @State private var showBlurPanel = false
+
     private var topBar: some View {
-        HStack(spacing: 12) {
-            Spacer()
-            Text("\(filtered.count) 个")
-                .font(.system(size: 12))
-                .foregroundStyle(.white.opacity(0.55))
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                Spacer()
+                // 右上角:模糊度调节的开关(原来是"n 个"数量,没用处已删)。
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                        showBlurPanel.toggle()
+                    }
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(showBlurPanel ? 0.95 : 0.55))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Capsule().fill(Color.white.opacity(showBlurPanel ? 0.16 : 0)))
+                }
+                .buttonStyle(.plain)
+                .help("调节背景模糊程度")
+            }
+            .padding(.horizontal, 40)
+
+            if showBlurPanel {
+                BlurSliderPanel(radius: $blurRadius)
+                    .padding(.horizontal, 40)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
-        .padding(.horizontal, 40)
-        // ★ 不能用固定值:窗口铺满整屏、盖住了菜单栏那块区域,
-        //   顶栏必须自己避开菜单栏,否则点击全被菜单栏吃掉(2026-09-15 的 bug)。
+        // 吞掉顶栏区域的单击,不让它落到根视图被当成"点空白"(关窗/回主页)。
+        // 滑杆的拖动手势优先级本来就更高,这里只兜单击。
+        .onTapGesture {}
         .padding(.top, ScreenMetrics.topBarTopPadding)
     }
 
@@ -667,6 +694,87 @@ struct TopLevelView: View {
 /// 泛型于条目类型:顶层网格用 `LaunchpadItem`、文件夹内页用 `AppItem`,
 /// 两边只有"怎么取 id"不一样,落点计算完全相同 —— 所以收成一个泛型实现。
 ///
+// MARK: - 背景模糊度调节(macOS 27 风格)
+
+/// 顶栏展开的模糊度调节面板。
+/// 视觉参照系统设置里"显示器"亮度条:深色胶囊面板 + 两端图标 + 细滑杆。
+/// 左端 = 模糊弱(空心方块),右端 = 模糊强(实心方块),对应壁纸的模糊半径 0~40。
+///
+/// 数值走 `@AppStorage("wallpaper.blurRadius")` 持久化,
+/// LaunchpadRoot 监听同一个键的变化去重算背景(见 refreshWallpaper)。
+struct BlurSliderPanel: View {
+    @Binding var radius: Double   // 0...40,直接就是模糊半径
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "square.on.square")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.6))
+            BlurSliderTrack(value: Binding(
+                get: { max(0, min(40, radius)) / 40 },
+                set: { radius = ($0 * 40).rounded() }
+            ))
+            Image(systemName: "square.fill.on.square.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.9))
+        }
+        .padding(.leading, 16)
+        .padding(.trailing, 14)
+        .padding(.vertical, 9)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.38))
+                .overlay(Capsule().strokeBorder(Color.white.opacity(0.10)))
+        )
+        // 吞掉面板上的单击 —— 不然会落到根视图被当成"点空白"把启动台关掉。
+        .onTapGesture {}
+    }
+}
+
+/// 滑杆本体:细胶囊轨道 + 白色进度 + 白色圆钮,拖到哪算哪。
+/// 不用系统 Slider —— macOS 的 Slider 样式跟"系统设置 27"那种胶囊条差太远,
+/// 自己画反而简单:一个 ZStack + DragGesture,没有隐藏行为。
+struct BlurSliderTrack: View {
+    @Binding var value: Double   // 0...1(已归一化)
+    @State private var trackWidth: CGFloat = 0
+
+    private let knobSize: CGFloat = 16
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let fill = max(0, min(w, w * value))
+            ZStack(alignment: .leading) {
+                // 轨道底
+                Capsule()
+                    .fill(Color.white.opacity(0.28))
+                    .frame(height: 5)
+                // 已滑过的部分
+                Capsule()
+                    .fill(Color.white)
+                    .frame(width: fill, height: 5)
+                // 圆钮
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: knobSize, height: knobSize)
+                    .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+                    .offset(x: max(0, min(w - knobSize, fill - knobSize / 2)))
+            }
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { g in
+                        // 点击轨道任意位置也能直接跳到那个值
+                        value = max(0, min(1, (g.location.x - knobSize / 2) / (w - knobSize)))
+                    }
+            )
+            .onAppear { trackWidth = w }
+        }
+        .frame(width: 190, height: 24)
+    }
+}
+
 /// 注意它是个 struct —— 每次 body 求值都会重建,所以
 /// **所有跨帧状态必须走 Binding**,不能在 struct 里存 var,否则会被重置。
 private struct GridDropDelegate<Item>: DropDelegate {
@@ -1136,6 +1244,9 @@ struct LaunchpadRoot: View {
     /// 系统「辅助功能 → 显示 → 减少透明度」是否开启。
     /// 已经模糊好的壁纸(见 WallpaperBackground.swift)。静态位图,不参与任何动画。
     @State private var wallpaper: NSImage?
+    /// 背景模糊半径(0~40)。TopLevelView 顶栏的滑杆写它,这里监听变化重算背景。
+    /// 两边读写的是同一个 UserDefaults 键,所以用 @AppStorage 天然同步。
+    @AppStorage("wallpaper.blurRadius") private var wallpaperBlurRadius: Double = 16
 
     private var activeFolder: FolderItem? {
         guard let id = activeFolderID else { return nil }
@@ -1204,16 +1315,26 @@ struct LaunchpadRoot: View {
         .onAppear {
             loadAndScan()
             appeared = true
-            // 模糊壁纸要读文件 + 解码 + 高斯模糊。冷启动实测约 130ms
-            // (ImageIO 框架首次加载 + CIContext 创建都算在里面),
-            // 之后命中内存缓存只要 3ms。130ms 放主线程会卡一下首屏,所以丢后台算。
-            let screen = TransferBox(NSScreen.main ?? NSScreen.screens.first)
-            Task.detached(priority: .userInitiated) {
-                let made = TransferBox(screen.value.flatMap {
-                    WallpaperBackground.image(for: $0)
-                })
-                await MainActor.run { wallpaper = made.value }
-            }
+            refreshWallpaper()
+        }
+        .onChange(of: wallpaperBlurRadius) { _ in
+            // 滑杆拖动/点击后重算背景。渲染约 20ms 且在后台线程,
+            // 拖动过程会连发多次 —— 反正都是后台算,后到的覆盖先到的,无感。
+            refreshWallpaper()
+        }
+    }
+
+    /// (重)算模糊壁纸。冷启动约 130ms、调滑杆重算约 20ms,都丢后台,主线程只贴图。
+    private func refreshWallpaper() {
+        // 模糊壁纸要读文件 + 解码 + 高斯模糊。冷启动实测约 130ms
+        // (ImageIO 框架首次加载 + CIContext 创建都算在里面),
+        // 之后命中内存缓存只要 3ms。130ms 放主线程会卡一下首屏,所以丢后台算。
+        let screen = TransferBox(NSScreen.main ?? NSScreen.screens.first)
+        Task.detached(priority: .userInitiated) {
+            let made = TransferBox(screen.value.flatMap {
+                WallpaperBackground.image(for: $0)
+            })
+            await MainActor.run { wallpaper = made.value }
         }
     }
 
