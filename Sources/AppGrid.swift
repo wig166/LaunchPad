@@ -1244,6 +1244,14 @@ struct LaunchpadRoot: View {
     /// 系统「辅助功能 → 显示 → 减少透明度」是否开启。
     /// 已经模糊好的壁纸(见 WallpaperBackground.swift)。静态位图,不参与任何动画。
     @State private var wallpaper: NSImage?
+    /// 同一张壁纸的"远景档"(更糊),开窗时作为对焦的起点。见 WallpaperBackground.farBlurRadius。
+    @State private var wallpaperFar: NSImage?
+    /// 背景是否已经"对上焦":false = 停在远景档(糊),true = 停在用户设定档(清晰)。
+    ///
+    /// ★ 这是**唯一**驱动背景透明度变化的量。
+    ///   开窗:false → true(对焦);关窗:true → false(散焦)。
+    ///   绝不另外再叠一层淡入 —— 上次的教训是两层淡入叠成 25% 亮度,看着像卡住。
+    @State private var focusIn = false
     /// "正在合上"标志 —— 关闭动画期间为 true,见 beginClose()。
     @State private var closing = false
     /// 背景模糊半径(0~40)。TopLevelView 顶栏的滑杆写它,这里监听变化重算背景。
@@ -1363,6 +1371,8 @@ struct LaunchpadRoot: View {
         //   于是"合上"的内容动画就只有一个触发点,不用给每条路径各写一遍。
         .onReceive(NotificationCenter.default.publisher(for: .launchpadWillClose)) { _ in
             withAnimation(AnimScale.spring(response: 0.24, dampingFraction: 0.92)) { closing = true }
+            // 关窗前先"散焦"回远景档,和开窗时的对焦对称。
+            withAnimation(.easeOut(duration: AnimScale.s(Self.focusDuration))) { focusIn = false }
         }
         // ★ 每次开窗重新解析一次壁纸。
         //   根视图只在启动时 onAppear 一次(关窗只是藏窗口,视图不销毁),
@@ -1374,16 +1384,40 @@ struct LaunchpadRoot: View {
     }
 
     /// (重)算模糊壁纸。冷启动约 130ms、调滑杆重算约 20ms,都丢后台,主线程只贴图。
+    ///
+    /// ★ 开窗时"对焦"用的时长(秒)。比窗口 alpha 的 0.14 略长一点:
+    ///   窗口先不透明(0.14s),模糊再收尾(0.20s),读起来是"浮出来之后定了一下焦",
+    ///   而不是"整块东西慢慢亮起来" —— 后者就是上次被吐槽"半天亮不起来"的手感。
+    private static let focusDuration: Double = 0.20
+
     private func refreshWallpaper() {
         // 模糊壁纸要读文件 + 解码 + 高斯模糊。冷启动实测约 130ms
         // (ImageIO 框架首次加载 + CIContext 创建都算在里面),
         // 之后命中内存缓存只要 3ms。130ms 放主线程会卡一下首屏,所以丢后台算。
+        // 两张都算:用户设定的那一档(清晰)+ 更糊一档的"远景"。
+        // 多算一张只是多一次 ~20ms 的渲染,而且都进缓存,之后开窗都是命中。
         let screen = TransferBox(NSScreen.main ?? NSScreen.screens.first)
         Task.detached(priority: .userInitiated) {
-            let made = TransferBox(screen.value.flatMap {
+            let near = TransferBox(screen.value.flatMap {
                 WallpaperBackground.image(for: $0)
             })
-            await MainActor.run { wallpaper = made.value }
+            let far = TransferBox(screen.value.flatMap {
+                WallpaperBackground.image(for: $0, blurRadius: WallpaperBackground.farBlurRadius)
+            })
+            await MainActor.run {
+                wallpaper = near.value
+                wallpaperFar = far.value
+                // ★ 必须等"糊的那张"真的上屏之后,再开始对焦。
+                //   同一个 runloop 里既换图又改 opacity,SwiftUI 会合成成一次变更 → 没有动画。
+                //   所以再往后推一个 tick。
+                if !focusIn {
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: AnimScale.s(Self.focusDuration))) {
+                            focusIn = true
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1415,13 +1449,28 @@ struct LaunchpadRoot: View {
         Color.clear
             .overlay {
                 if let wallpaper {
-                    // ★ 自己模糊好的壁纸(见 WallpaperBackground.swift)。
-                    //   静态位图,每帧只是贴一张图,零实时模糊开销;
-                    //   也不受系统「减少透明度」影响 —— 好看和流畅同时拿到,
-                    //   不用像上一版那样被迫二选一。
-                    Image(nsImage: wallpaper)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
+                    // ★ 开合时的"对焦"层:
+                    //   底下永远铺**更糊的那张**,上面盖**用户设定那张**,用 opacity 交叉。
+                    //   focusIn=false → 露出糊的(远景);focusIn=true → 盖上清晰的(对上焦)。
+                    //
+                    //   为什么不用"每帧改模糊半径":480px 高斯模糊 CPU 约 11ms,
+                    //   一帧预算才 16.7ms,塞不下。两档交叉淡入只做合成,等于白送。
+                    //
+                    //   ★ 只动 opacity **一个**量。上次两层淡入叠成 25% 亮度、
+                    //   被吐槽"半天亮不起来",就是同一类错误 —— 这里不重犯。
+                    let hasFar = wallpaperFar != nil
+                    ZStack {
+                        if let far = wallpaperFar {
+                            Image(nsImage: far)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                        }
+                        Image(nsImage: wallpaper)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            // 没有远景档时(极少数渲染失败)直接全显示,绝不能露出空白
+                            .opacity(hasFar ? (focusIn ? 1 : 0) : 1)
+                    }
                 } else {
                     // 回退:极少数情况拿不到壁纸文件时(比如动态壁纸解析失败)。
                     //
