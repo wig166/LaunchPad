@@ -1334,7 +1334,10 @@ struct LaunchpadRoot: View {
             appeared = true
             refreshWallpaper()
         }
-        .onChange(of: wallpaperBlurRadius) { _ in
+        // ★ 用两参数写法(macOS 14 起)。旧的 `onChange(of:perform:)` 在 macOS 14
+        //   就废弃了,编译器每次都刷一条警告。以前不改是因为目标系统写得很老、
+        //   改了怕不兼容;现在 build.sh 明确按 macOS 15.0 编译,用新写法没有任何风险。
+        .onChange(of: wallpaperBlurRadius) { _, _ in
             // 滑杆拖动/点击后重算背景。渲染约 20ms 且在后台线程,
             // 拖动过程会连发多次 —— 反正都是后台算,后到的覆盖先到的,无感。
             refreshWallpaper()

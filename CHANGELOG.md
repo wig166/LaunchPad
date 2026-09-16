@@ -42,7 +42,7 @@ codesign 会把包内文件清单写进 `CodeResources`,旧清单还在,它就�
 
 ---
 
-## v1.14 (build 21) —— 2026-09-16
+## v1.14 (build 22) —— 2026-09-16
 
 ### 起因
 
@@ -76,6 +76,64 @@ atime 刷成"现在" —— 下次启动它还是最新,再选它,再刷……**
   再改名留下的残骸,**签名时它还不存在**,所以只在签名前清理根本管不到它,
   自检那会儿也确实显示 valid,等下次校验才暴露。
   改法:签名前清一次,**签完再清一次**。别省后面那一步,不然用户下载又是"已损坏"。
+
+### 升级 Command Line Tools 27.0 之后,项目突然编不过了(220 条报错)
+
+9 月 16 日晚上,系统弹了「Command Line Tools for Xcode 27.0」的更新,我点了。
+点完之后 `./build.sh` 直接炸:**220 个 error**。
+
+第一条是:
+
+```
+error: external macro implementation type 'SwiftUIMacros.StateMacro'
+       could not be found for macro 'State()'; plugin for module 'SwiftUIMacros' not found
+```
+
+后面跟着一串 `cannot assign to property: 'self' is immutable` ——
+看着像代码被人删了一半,其实**根因只有一个**:新 SDK 把 SwiftUI 的 `@State`
+从"属性包装器"改成了**宏**。宏要展开就得能找到它的插件 `libSwiftUIMacros.dylib`,
+而这个插件**只有完整 Xcode 里才有**。
+Command Line Tools 只带了 `libSwiftMacros` / `libObservationMacros` / `libTestingMacros`,
+偏偏没带 SwiftUI 那个。所以只要用命令行工具 + SDK 27,任何写了 `@State` 的 SwiftUI 代码都编不过。
+
+我试了一轮才发现规律(用带 `@State` 的最小文件逐个组合试):
+
+| 编译方式 | 结果 |
+|---|---|
+| SDK 27 + 默认目标 | ❌ 宏插件找不到 |
+| SDK 27 + 目标写 15.0 / 14.0 / 26.0 | ❌ 一样报错(和最低系统版本无关) |
+| **SDK 26.5**(不管目标写几) | ✅ 编过 —— 那个版本 `@State` 还是普通的 `@propertyWrapper` |
+
+所以解法是:**用还没把 `@State` 变成宏的那个 SDK**。`build.sh` 里我加了一段自动挑选:
+遍历 `SDKs/MacOSX*.sdk`,读它的 `SwiftUICore.swiftinterface`,**只要里面出现 `macro State()`
+就跳过**(判据是查文本,不用试编译,快);挑到最新的可用版本就用它。
+一个都挑不到就直接报错退出,并说清楚两条出路(装完整 Xcode / 装回带旧 SDK 的命令行工具)。
+
+以后苹果把这个插件补进命令行工具了,这段会自动跳到新 SDK,不用改。
+
+### 顺带发现一个**已经发出去的包**的隐患:最低系统版本在悄悄漂移
+
+排查时顺手看了一眼编译产物里的最低系统版本,发现一个我没注意到的问题:
+
+```
+旧工具链打的包:  minos 18.0      ← 一个不存在的 macOS 版本号
+现在:            minos 15.0
+```
+
+原因是**我没写 `-target`**,让编译器用默认目标 —— 而默认目标是跟着**工具链/宿主系统**走的。
+换了工具链,这个值自己就变了,我完全不知情。桌面上那份 `LaunchPad-v1.14.zip` 里
+就是 `minos 18.0`;而且**所有发出去的版本都是这么打的**。
+它的实际后果我不敢打包票说死,但有一点是确定的:**这个值从来没被我有意声明过,
+它一直在跟着工具链漂**。别人在旧系统上打不开,很可能就出在这儿。
+
+现在 `build.sh` 把最低系统版本**显式钉成 15.0**(和 `Info.plist` 里的
+`LSMinimumSystemVersion` 保持一致,而且脚本会自动把后者也一起改掉,防止两处对不上)。
+两处为什么要一致:
+- Mach-O 里的 `minos` → 决定**动态加载器**让不让 app 起来
+- `Info.plist` 的 `LSMinimumSystemVersion` → 决定 Finder / 系统怎么判断和提示
+
+另外升级工具链后多出来的那条 `onChange(of:perform:)` 废弃警告也顺手清掉了
+(改成 macOS 14 起的两参数写法)。
 
 ### 顺手改的几处(动画那部分我返工了两次)
 

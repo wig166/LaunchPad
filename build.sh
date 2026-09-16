@@ -12,10 +12,60 @@ APP="/Applications/LaunchPad.app"
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
+echo "==> 选择可用的 SDK"
+# ★★ 2026-09-16 踩的大坑(升级 Command Line Tools 27.0 之后项目突然编不过):
+#
+#   新 SDK 里 SwiftUI 的 `@State` 从"属性包装器"改成了**宏**:
+#       public macro State() = #externalMacro(module: "SwiftUIMacros", ...)
+#   宏要展开就必须能找到它的插件 `libSwiftUIMacros.dylib`。而这个插件
+#   **只有完整 Xcode 里才有** —— Command Line Tools 只带了
+#   libSwiftMacros / libObservationMacros / libTestingMacros,就是没有 SwiftUI 那个。
+#   于是 `@State` 全线报:
+#       external macro implementation type 'SwiftUIMacros.StateMacro' could not be found
+#   一条报错还会连出十几个 "cannot assign to property: 'self' is immutable",
+#   总共 220 条,看着像代码全烂了,其实根因就这一个。
+#
+#   解法:用**还没把 @State 变成宏的那个 SDK**(本机是 MacOSX26.5.sdk)。
+#   26.5 的 SwiftUICore 里 State 还是普通的 @propertyWrapper,不需要插件。
+#   判据可以直接查接口文件里有没有 `macro State()`,不用试编译。
+#
+#   顺带把最低系统版本写成**显式**的(见下面的 -target):
+#   不加的话,编译器的默认目标会跟着**宿主系统**走 —— 升级工具链后
+#   minos 会悄悄涨到 27.0,别人下载了在旧系统上直接打不开。
+#   之前旧工具链生成的包 minos 是 18.0(macOS 15 的机器会被拒),
+#   所以这一步同时是在修一个已经发出去的包的兼容性问题。
+SDK=""
+for cand in /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk; do
+  [ -L "$cand" ] && continue                       # 跳过 MacOSX.sdk 这类软链
+  iface=$(ls "$cand"/System/Library/Frameworks/SwiftUICore.framework/Modules/SwiftUICore.swiftmodule/*.swiftinterface 2>/dev/null | head -1)
+  [ -z "$iface" ] && continue
+  if /usr/bin/grep -q 'macro State()' "$iface" 2>/dev/null; then
+    continue                                       # @State 是宏 → CLT 展不开,不能用
+  fi
+  if [ -z "$SDK" ] || [ "$cand" \> "$SDK" ]; then SDK="$cand"; fi
+done
+
+if [ -z "$SDK" ]; then
+  echo "❌ 找不到可用的 SDK:所有已装 SDK 的 SwiftUI 都把 @State 定义成了宏,"
+  echo "   而命令行工具里没有对应的宏插件(只有完整 Xcode 才带)。"
+  echo "   两种走法:① 装完整 Xcode;② 装回带旧 SDK 的命令行工具。"
+  exit 1
+fi
+
+# 最低支持到哪个 macOS —— 必须显式写,别让编译器跟着宿主系统漂移。
+# 15.0 与 Sources/Info.plist 里的 LSMinimumSystemVersion 保持一致。
+MACOS_MIN="15.0"
+ARCH="$(uname -m)"
+echo "    SDK: $SDK"
+echo "    最低系统: macOS $MACOS_MIN"
+
 echo "==> 编译 Swift 源码"
 # 注意两点:
-#  1. 不要加 -target arm64-apple-macosx13.0,会触发一堆
-#     "only available in macOS 14.0" 的误报。用默认宿主 SDK 即可。
+#  1. 之前这里写的是"不要加 -target,会触发一堆 only available in macOS 14.0 的误报"。
+#     那是**旧工具链**下的经验:当时宿主 SDK 是 15.5,代码里用了 macOS 14 的
+#     两参数 onChange,目标写得比 SDK 老就会报一堆可用性错误。
+#     现在固定用 26.5 的 SDK、目标 15.0(SDK 比目标新是正常方向),
+#     这类报错不会出现 —— 实测全项目只剩 1 条 onChange 废弃警告。
 #  2. 链 Carbon 而不是 ApplicationServices —— 全局快捷键已经改用
 #     registerEventHotKey,不再需要辅助功能权限(见 Sources/main.swift 注释)。
 xcrun swiftc \
@@ -29,11 +79,22 @@ xcrun swiftc \
   -framework AppKit \
   -framework SwiftUI \
   -framework Carbon \
+  -sdk "$SDK" \
+  -target "${ARCH}-apple-macosx${MACOS_MIN}" \
   -O
 
 echo "==> 拷贝 Info.plist"
 # ★ 必须拷:CFBundleLocalizations 决定了 app 显示名能不能本地化成中文
 cp Sources/Info.plist "$APP/Contents/Info.plist"
+
+# ★ 让 Info.plist 的 LSMinimumSystemVersion 永远跟着上面的 MACOS_MIN 走。
+#   两个地方必须一致:
+#     · Mach-O 里的 minos(编译时 -target 写进去的)→ 决定**动态加载器**让不让起
+#     · Info.plist 的 LSMinimumSystemVersion → 决定 Finder/系统的判断与提示
+#   不一致的后果:系统觉得能装、点开才发现加载不了(或者反过来提示"需要更新版本")。
+#   这里直接改安装副本,不动仓库里的源文件 —— 免得源文件被构建过程改脏。
+/usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $MACOS_MIN" "$APP/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string $MACOS_MIN" "$APP/Contents/Info.plist"
 
 echo "==> 拷贝图标"
 if [ -f Sources/AppIcon.icns ]; then
