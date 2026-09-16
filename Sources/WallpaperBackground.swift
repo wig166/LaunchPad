@@ -59,6 +59,33 @@ import ImageIO
 ///   里按 display UUID 索引的 Configuration blob —— 那是嵌套二进制 plist,
 ///   还要把 display UUID 映射到 `NSScreen`,复杂度不划算,没做。
 ///
+///   👆 **这段是 v1.13 的判断,2026-09-16 实测推翻了一半**:
+///     Index.plist 里照片池那种 Choice 的 `Files` 数组是**空的**,
+///     全文、EncodedOptionValues、连壁纸视频的 UUID 都搜不到 ——
+///     Apple 压根没把"当前显示哪一张"写进任何可读文件。
+///     所以"解析 plist 求彻底准确"这条路不存在,别再惦记。
+///
+/// ### ★★ 第三种情况:航拍视频壁纸(v1.14 才发现,**未修**)
+///
+///   系统壁纸可以是 Apple 的 4K 航拍**视频**
+///   (`~/Library/Application Support/com.apple.wallpaper/aerials/videos/*.mov`,
+///    清单在 manifest/entries.json 里,比如 `GG_A_SUNSET` = 金门大桥日落)。
+///   这种情况下 macOS 27 的 `desktopImageURL` 返回的既不是视频也不是图片,
+///   而是一个漂移的上级目录(`~/Library`)。我们照旧下探到照片池,挑出来的
+///   当然是错的 —— 池子里可能根本没有当前壁纸。
+///   (本机实测:桌面是金门大桥日落航拍视频,池子里是 2023~2025 年的旧照片。)
+///
+///   要修只能靠:① 手动指定背景图;② 列出航拍视频让用户在设置里挑;
+///   ③ 逆向 WallpaperKit 私有接口(脆弱,不推荐)。
+///   在此之前,视频壁纸用户的背景不会跟桌面一致 —— 已知限制,不是 bug。
+///
+/// ### atime 启发式的三个坑(v1.14 修掉前两个)
+///
+///   1. 自我污染 → **已修**:读图前后还原 atime(见 `restoreAccessTime`)。
+///   2. 同秒并列不稳定 → **已修**:排序改成 (atime 降序, 文件名升序),结果确定。
+///   3. **relatime 挂载**:这块盘只在该刷的时候才刷 atime,并不是"系统每次
+///      渲染都刷"。atime 只能当"最近碰过"的粗略信号用 —— 没修,修不了。
+///
 /// 读壁纸文件**不需要任何权限**:读的是磁盘上的图片文件,不是截屏,
 /// 跟「屏幕录制」权限毫无关系 —— 不要再把权限地狱请回来。
 ///
@@ -102,6 +129,8 @@ enum WallpaperBackground {
     ///
     /// - Parameter darken: 额外压暗比例,保证白色图标名在任何壁纸上都读得清。
     static func image(for screen: NSScreen, darken: CGFloat = 0.18) -> NSImage? {
+        migrateLegacyPollutionOnce()          // 见下方"老版本污染的善后"
+
         guard let file = locateWallpaperFile(for: screen) else {
             lastSourcePath = "(未找到壁纸文件)"
             return nil
@@ -118,6 +147,17 @@ enum WallpaperBackground {
             return hit
         }
         cacheLock.unlock()
+
+        // ★★ 记住"读之前"的 atime,读完之后还原回去。
+        //
+        //   为什么必须还原(2026-09-16 踩到):照片池靠"谁的访问时间最新"来猜
+        //   当前壁纸,而我们自己读图的那一下就会把选中那张的 atime 刷成"现在"。
+        //   于是下次启动它还是最新 → 永远选它 → 自我锁定。选对了就一直对,
+        //   选错了就一直错(本机就被锁在一张昏暗的旧照片上,怎么换壁纸都不变)。
+        //
+        //   macOS 没有 Linux 的 O_NOATIME,读文件必然改 atime,只能事后补回来。
+        let accessBefore = try? file.resourceValues(forKeys: [.contentAccessDateKey]).contentAccessDate
+        defer { if let d = accessBefore { restoreAccessTime(of: file, to: d) } }
 
         guard let made = render(url: file, displaySize: size, darken: darken) else { return nil }
 
@@ -149,6 +189,50 @@ enum WallpaperBackground {
         let fallback = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/\(desktopPhotoPoolName)")
         return mostRecentlyAccessedImage(in: fallback)
+    }
+
+    /// 把文件的访问时间改回指定值(只改 atime,mtime 用 UTIME_OMIT 跳过)。
+    ///
+    /// 文件是用户自己的,改 atime 不需要任何权限。失败就失败,不影响主流程 ——
+    /// 最多是atime 又被刷一次,行为退回修复前的样子。
+    private static func restoreAccessTime(of url: URL, to date: Date) {
+        let seconds = date.timeIntervalSince1970
+        let sec = Int(seconds)
+        let nsec = Int((seconds - Double(sec)) * 1_000_000_000)
+
+        url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return }
+            // Darwin 上 UTIME_OMIT = -2,表示"这一项不变"
+            var times = [
+                timespec(tv_sec: sec, tv_nsec: nsec),
+                timespec(tv_sec: 0, tv_nsec: -2),
+            ]
+            _ = utimensat(AT_FDCWD, path, &times, 0)
+        }
+    }
+
+    /// 老版本留下的一次性善后:把被污染过的那张的 atime 拉回 mtime。
+    ///
+    /// 老版本(v1.13 及之前)读图不还原 atime,于是"最近一次被点中的那张"
+    /// 的 atime 是启动时刻,比系统真正最后一次碰它的时间还新,排序永远第一。
+    /// 这个状态我们从 atime 本身看不出来,只能做一次:
+    /// 把当前 atime 最新的那张,atime 拉回它的 mtime(近似"最后一次真正被用到")。
+    /// 之后每次启动都还原 atime,这个坑不会再出现了。
+    private static func migrateLegacyPollutionOnce() {
+        let flag = "wallpaper.atimeRepairDone"
+        if UserDefaults.standard.bool(forKey: flag) { return }
+        UserDefaults.standard.set(true, forKey: flag)
+
+        let pool = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/\(desktopPhotoPoolName)")
+        guard let newest = mostRecentlyAccessedImage(in: pool) else { return }
+        guard let values = try? newest.resourceValues(forKeys: [.contentAccessDateKey, .contentModificationDateKey]),
+              let mtime = values.contentModificationDate,
+              let atime = values.contentAccessDate else { return }
+        // 只有"atime 明显晚于 mtime"才像是被污染过,别误伤正常文件
+        if atime.timeIntervalSince(mtime) > 60 {
+            restoreAccessTime(of: newest, to: mtime)
+        }
     }
 
     /// 从 `root` 出发广度优先下探,找到名为 `com.apple.desktop.photos` 的目录。
@@ -202,7 +286,16 @@ enum WallpaperBackground {
             return (url, accessed)
         }
 
-        return candidates.max(by: { $0.1 < $1.1 })?.0
+        // ★ 排序必须是确定性的。
+        //   老写法用 max(by:),在系统一次预载多张(atime 完全相同)时,
+        //   选谁取决于目录遍历顺序 —— 每次启动背景都不一样。
+        //   现在再按文件名兜底,保证同秒并列时结果稳定。
+        return candidates
+            .sorted { lhs, rhs in
+                if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                return lhs.0.lastPathComponent < rhs.0.lastPathComponent
+            }
+            .first?.0
     }
 
     // MARK: - 渲染
