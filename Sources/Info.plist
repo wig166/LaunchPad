@@ -2,22 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>
-    <string>LaunchPad</string>
-    <key>CFBundleDisplayName</key>
-    <string>启动台</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.xingxing.launchpad</string>
-	<key>CFBundleVersion</key>
-	<string>15</string>
-	<key>CFBundleShortVersionString</key>
-	<string>1.12</string>
-	<!-- 开发地区:英文兜底 -->
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
-	<!-- ★ 关键:必须显式声明支持的语言,否则 Bundle.main.preferredLocalizations 会回退到 en,
-	     导致读第三方/系统 app 的 localizedInfoDictionary 时全部拿到英文显示名
-	     (表现为 "WeChat" 而不是 "微信"、"Calendar" 而不是 "日历") -->
+	<key>CFBundleDisplayName</key>
+	<string>启动台</string>
+	<key>CFBundleExecutable</key>
+	<string>LaunchPad</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.xingxing.launchpad</string>
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>
@@ -62,17 +56,19 @@
 		<string>es_419</string>
 		<string>fr_CA</string>
 	</array>
-    <key>CFBundleExecutable</key>
-    <string>LaunchPad</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>NSHumanReadableCopyright</key>
-    <string>MIT License · 创作者-星之所向-阿星陪你走过丝绸之路</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>15.0</string>
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
+	<key>CFBundleName</key>
+	<string>LaunchPad</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.13</string>
+	<key>CFBundleVersion</key>
+	<string>16</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>MIT License · 创作者-星之所向-阿星陪你走过丝绸之路</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
 </dict>
 </plist>
