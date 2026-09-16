@@ -42,7 +42,39 @@ import ImageIO
 ///     但系统每次真正拿某张图去渲染桌面时,该文件的**访问时间(atime)**
 ///     会被刷新 —— 所以取 atime 最新的那张,就是当前壁纸。
 ///
-/// ### ★ atime 法的两个已知局限(2026-09-15 macOS 27 上实测到)
+/// ### ★ 第三种情况:系统"兜底图"(2026-09-16 实测,**已修**)
+///
+///   上面说"轮播时返回目录"—— **这条在 macOS 27 上已经不成立了**。
+///   实测开照片轮播时,`desktopImageURL` 返回的是
+///   `/System/Library/CoreServices/DefaultDesktop.heic`,一个**普通文件**。
+///   系统是"答不上来当前到底是哪一张",就甩了张系统默认图出来。
+///
+///   老代码见文件就 `return`,于是**照片池从来没被查过**,表现就是
+///   用户反馈的"桌面轮播了,启动台背景永远固定一张"(2026-09-16)。
+///
+///   修法:命中 `/System/Library/CoreServices/` 下的图就**不当真壁纸**,
+///   继续往下找照片池(见 `isSystemFallbackImage`)。
+///   判据收窄到 `CoreServices` 是因为:用户**可以**真选一张系统自带壁纸,
+///   那些在 `/System/Library/Desktop Pictures/`,是真壁纸,不能误伤。
+///
+/// ### ★★ 第四种情况:航拍视频壁纸(2026-09-16 才发现,**未修**)
+///
+///   系统壁纸可以是 Apple 的 4K 航拍**视频**
+///   (`~/Library/Application Support/com.apple.wallpaper/aerials/videos/*.mov`,
+///    清单在 manifest/entries.json 里,比如 `GG_A_SUNSET` = 金门大桥日落)。
+///   这种情况下桌面根本没有"一张图片",照片池里也是别的东西。
+///   要修只能靠:① 手动指定背景图;② 列出航拍视频让用户在设置里挑;
+///   ③ 逆向 WallpaperKit 私有接口(脆弱,不推荐)。
+///   在此之前,视频壁纸用户的背景不会跟桌面一致 —— 已知限制,不是 bug。
+///
+/// ### ★ "读配置求当前第几张"这条路不存在(2026-09-16 再确认一次)
+///
+///   `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist` 里
+///   照片轮播那个 Choice 的 `Files` 数组是**空的**,只有
+///   `Provider: com.apple.wallpaper.choice.image` 和 `Shuffle: afterDuration`。
+///   Apple 没把"当前显示哪一张"写进任何可读文件 —— 别再惦记这条路。
+///
+/// ### atime 法的两个已知局限(2026-09-15 macOS 27 上实测到)
 ///
 ///   1. **会被自己污染**:排序只读元数据、不碰文件内容,所以不脏;但最后
 ///      `CGImageSourceCreateWithURL` 真读内容那一下,会把选中那张的 atime
@@ -64,20 +96,6 @@ import ImageIO
 ///     全文、EncodedOptionValues、连壁纸视频的 UUID 都搜不到 ——
 ///     Apple 压根没把"当前显示哪一张"写进任何可读文件。
 ///     所以"解析 plist 求彻底准确"这条路不存在,别再惦记。
-///
-/// ### ★★ 第三种情况:航拍视频壁纸(v1.14 才发现,**未修**)
-///
-///   系统壁纸可以是 Apple 的 4K 航拍**视频**
-///   (`~/Library/Application Support/com.apple.wallpaper/aerials/videos/*.mov`,
-///    清单在 manifest/entries.json 里,比如 `GG_A_SUNSET` = 金门大桥日落)。
-///   这种情况下 macOS 27 的 `desktopImageURL` 返回的既不是视频也不是图片,
-///   而是一个漂移的上级目录(`~/Library`)。我们照旧下探到照片池,挑出来的
-///   当然是错的 —— 池子里可能根本没有当前壁纸。
-///   (本机实测:桌面是金门大桥日落航拍视频,池子里是 2023~2025 年的旧照片。)
-///
-///   要修只能靠:① 手动指定背景图;② 列出航拍视频让用户在设置里挑;
-///   ③ 逆向 WallpaperKit 私有接口(脆弱,不推荐)。
-///   在此之前,视频壁纸用户的背景不会跟桌面一致 —— 已知限制,不是 bug。
 ///
 /// ### atime 启发式的三个坑(v1.14 修掉前两个)
 ///
@@ -149,6 +167,11 @@ enum WallpaperBackground {
             lastSourcePath = "(未找到壁纸文件)"
             return nil
         }
+        // ★ 只在"换了一张"的时候记一行,免得每次开窗都刷屏。
+        //   "背景永远是同一张"这类问题,靠这行日志一眼就能看出来。
+        if lastSourcePath != file.path {
+            Diag.log("壁纸: 采用 \(file.lastPathComponent)  [\(file.deletingLastPathComponent().path)]")
+        }
         lastSourcePath = file.path
 
         let size = screen.frame.size
@@ -184,25 +207,51 @@ enum WallpaperBackground {
     // MARK: - 定位壁纸文件
 
     private static func locateWallpaperFile(for screen: NSScreen) -> URL? {
-        if let url = NSWorkspace.shared.desktopImageURL(for: screen) {
+        let systemURL = NSWorkspace.shared.desktopImageURL(for: screen)
+
+        // 系统给的是"目录"的情况:可能是照片池本身,也可能要往下探。
+        if let url = systemURL {
             var isDirectory: ObjCBool = false
-            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-                if !isDirectory.boolValue {
-                    return url          // 普通静态壁纸
-                }
-                // 目录本身就是照片池
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
                 if let hit = mostRecentlyAccessedImage(in: url) { return hit }
-                // ★ 不然就往下搜 —— 往下几级不确定,见文件头说明。
                 if let pool = findPhotoPool(under: url),
                    let hit = mostRecentlyAccessedImage(in: pool) { return hit }
             }
         }
 
-        // 兜底:照片随机播放壁纸的固定位置。
+        // 走到照片池前,先问一句:系统给的那张是真壁纸吗?
+        //
+        // ★★ 2026-09-16 实测修掉的"背景永远不变"的 bug:
+        //    开启桌面照片轮播后,系统答不上来"当前到底是哪一张",
+        //    于是 `desktopImageURL` 返回**系统兜底图**
+        //    `/System/Library/CoreServices/DefaultDesktop.heic` —— 一个**普通文件**。
+        //    老逻辑见文件就 `return`,照片池从来没被查过,背景永远是那张默认图。
+        //    所以这里:命中兜底图就**不采用**,继续往下找照片池。
+        var plainFile: URL?
+        if let url = systemURL,
+           FileManager.default.fileExists(atPath: url.path),
+           !isSystemFallbackImage(url) {
+            plainFile = url
+        }
+
+        // 照片池:照片随机播放壁纸的固定位置。
         // 这个路径是实测的绝对位置,不受 desktopImageURL 返回值漂移影响。
         let fallback = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/\(desktopPhotoPoolName)")
-        return mostRecentlyAccessedImage(in: fallback)
+        if let hit = mostRecentlyAccessedImage(in: fallback) { return hit }
+
+        // 池里也没有,才退回系统给的那张(是真壁纸就用,兜底图也比没有强)。
+        return plainFile ?? systemURL
+    }
+
+    /// 系统"兜底图"—— 不是用户选的壁纸,不能当真。
+    ///
+    /// 判据刻意收窄到 `CoreServices`:用户**可以**真的选一张系统自带壁纸,
+    /// 那些在 `/System/Library/Desktop Pictures/` 下,是**真壁纸,不能误伤**;
+    /// 而 `CoreServices` 只放系统内部资源,出现在这里的桌面图 = "我答不上来"。
+    private static func isSystemFallbackImage(_ url: URL) -> Bool {
+        url.path.hasPrefix("/System/Library/CoreServices/")
     }
 
     /// 把文件的访问时间改回指定值(只改 atime,mtime 用 UTIME_OMIT 跳过)。

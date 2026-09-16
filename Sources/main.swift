@@ -27,6 +27,16 @@ extension Notification.Name {
     /// 不用给每条路径各写一遍 withAnimation,也不会漏。
     static let launchpadWillClose = Notification.Name("LaunchPadWillClose")
 
+    /// "启动台窗口已经打开"—— 每次开窗都发一条。
+    ///
+    /// 为什么要它:壁纸**会在后台被系统轮播掉**,但 SwiftUI 的根视图
+    /// 在整个进程生命周期里只 `onAppear` 一次(关窗只是把窗口藏起来,
+    /// 视图层次没销毁)。于是光靠 `onAppear` 重算壁纸的话,
+    /// 一次会话里背景永远是启动那一刻那张 —— 用户看到的就是"固定不换"。
+    /// 所以开窗时补一条通知,让内容层重新解析一次壁纸。
+    /// 代价:一次目录扫描 + atime 排序,约 1ms;没换文件就直接命中缓存。
+    static let launchpadDidOpen = Notification.Name("LaunchPadDidOpen")
+
     // ── 下面两条只在调试自测里用,见 AppDelegate.setupDebugHooks() ──
     static let launchpadDebugOpen = Notification.Name("LaunchPadDebugOpen")
     static let launchpadDebugClose = Notification.Name("LaunchPadDebugClose")
@@ -639,6 +649,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 """)
             }
         }
+
+        // ★ 通知内容层:可以重算壁纸了。
+        //   根视图只在进程启动时 onAppear 一次,关窗不销毁视图 ——
+        //   没有这一条的话,系统把桌面壁纸轮播走了,启动台背景却还是启动那一刻那张。
+        NotificationCenter.default.post(name: .launchpadDidOpen, object: nil)
     }
 
     /// 显示窗口并淡入(0.14s)。

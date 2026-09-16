@@ -1364,6 +1364,13 @@ struct LaunchpadRoot: View {
         .onReceive(NotificationCenter.default.publisher(for: .launchpadWillClose)) { _ in
             withAnimation(AnimScale.spring(response: 0.24, dampingFraction: 0.92)) { closing = true }
         }
+        // ★ 每次开窗重新解析一次壁纸。
+        //   根视图只在启动时 onAppear 一次(关窗只是藏窗口,视图不销毁),
+        //   所以没有这一条的话,系统把桌面轮播走了,这里的背景还是老样子。
+        //   壁纸没换就直接命中缓存,开销只有一次目录扫描 ≈1ms。
+        .onReceive(NotificationCenter.default.publisher(for: .launchpadDidOpen)) { _ in
+            refreshWallpaper()
+        }
     }
 
     /// (重)算模糊壁纸。冷启动约 130ms、调滑杆重算约 20ms,都丢后台,主线程只贴图。
