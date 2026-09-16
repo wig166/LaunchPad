@@ -18,6 +18,43 @@ import Carbon.HIToolbox
 /// 全局快捷键的 four-char 签名 'LPAD'
 private let kHotKeySignature: OSType = 0x4C504144
 
+extension Notification.Name {
+    /// "启动台窗口即将收起来"—— 任何原因(Esc / 点空白 / 点开 App / 失活)都算。
+    ///
+    /// 为什么要有它:关窗路径有好几条,但"内容层合上"的动画只该有一处。
+    /// closeWindow() 是这几条路径的**唯一汇合点**(它们最后都调它),
+    /// 所以通知在那里发,SwiftUI 那边收到后播一次缩放动画 ——
+    /// 不用给每条路径各写一遍 withAnimation,也不会漏。
+    static let launchpadWillClose = Notification.Name("LaunchPadWillClose")
+
+    // ── 下面两条只在调试自测里用,见 AppDelegate.setupDebugHooks() ──
+    static let launchpadDebugOpen = Notification.Name("LaunchPadDebugOpen")
+    static let launchpadDebugClose = Notification.Name("LaunchPadDebugClose")
+}
+
+/// 动画时长的**调试倍数**。
+///
+/// 由来:`LP_ANIMSCALE=6` 会把开合动画整体拉长 6 倍。为什么要这个 ——
+/// 因为"过渡到底有没有真的播"靠肉眼在 300ms 里根本说不准(上一版就是
+/// 我以为在播、其实被 Group 上的 .animation 吃掉了,用户一看就是"没了")。
+/// 把它拉长到 2 秒,再用抓帧工具逐帧看,是不是真在过渡就一目了然。
+///
+/// 正常启动(没有这个环境变量)恒等于 1,零影响。
+enum AnimScale {
+    static let factor: Double = {
+        let raw = ProcessInfo.processInfo.environment["LP_ANIMSCALE"] ?? ""
+        guard let v = Double(raw), v > 0, v != 1 else { return 1 }
+        Diag.log("动画时长倍数 LP_ANIMSCALE=\(v)(仅调试,正常运行为 1)")
+        return v
+    }()
+
+    static func s(_ base: Double) -> Double { base * factor }
+
+    static func spring(response: Double, dampingFraction: Double) -> Animation {
+        .spring(response: s(response), dampingFraction: dampingFraction)
+    }
+}
+
 /// 诊断日志 —— 专门为了抓「截图后跳走」这个问题。
 ///
 /// 为什么不靠猜:这个 bug 前后改过两次都没根治,每次都是"大概率是这样吧"。
@@ -352,6 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         NSScreen.main?.backingScaleFactor ?? 0))
         StallWatch.startIfEnabled()
         setupWorkspaceObservers()
+        setupDebugHooks()
         setupGlobalHotkey()
         prewarmWallpaper()
         openWindow()
@@ -385,6 +423,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didActivateApplicationNotification,
             object: nil
         )
+    }
+
+    /// 调试自测窗口的开关(**只在 LP_ANIMTEST=1 时挂载**)。
+    ///
+    /// 为什么需要:验证"开合动画到底有没有播"时,我没法用脚本去点屏幕
+    /// (点屏幕需要辅助功能权限)。所以留两条通知,让 app 自己收窗/开窗 ——
+    /// 自测流程在 `LaunchpadRoot.runAnimationSelfTestIfNeeded()` 里。
+    ///
+    /// ⚠️ 走的是跟真实路径**同一批函数**(closeWindow / openWindow),
+    ///    不是另写一套,所以测出来的就是真实行为。
+    private func setupDebugHooks() {
+        // 注意取值要和 AppGrid 里 runAnimationSelfTestIfNeeded 认的模式一致,
+        // 否则会出现"自测说要关窗、钩子却没挂"的静默失效(踩过一次)。
+        let mode = ProcessInfo.processInfo.environment["LP_ANIMTEST"] ?? ""
+        guard ["folder", "window", "all", "1"].contains(mode) else { return }
+        Diag.log("动画自测:已挂载调试开/关窗钩子 (LP_ANIMTEST=\(mode))")
+        NotificationCenter.default.addObserver(
+            forName: .launchpadDebugOpen, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.openWindow()
+        }
+        NotificationCenter.default.addObserver(
+            forName: .launchpadDebugClose, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.closeWindow(reason: "动画自测")
+        }
     }
 
     @objc private func appDidActivate(_ note: Notification) {
@@ -577,12 +641,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 显示窗口并淡入(0.18s)。
+    /// 显示窗口并淡入(0.14s)。
     ///
     /// 为什么要淡入而不是直接 makeKeyAndOrderFront:
     ///   窗口是不透明的、铺满整屏,直接显示就是"啪"地糊一屏,很唐突。
-    ///   先把 alpha 设 0 再动画到 1,配合 SwiftUI 那边的内容缩放,
+    ///   先把 alpha 设 0 再动画到 1,配合 SwiftUI 那边的内容微缩放,
     ///   整体就是"打开"的手感(和关闭时的淡出对称)。
+    ///
+    /// ★ 2026-09-16 第二次调整:0.18 → 0.14。
+    ///   用户实测"有点卡、时长有点长"。这里要说明白一件事:
+    ///   淡入**只有这一层**(SwiftUI 那边内容层已经不再做 opacity 淡入了,
+    ///   见 AppGrid.swift 里 contentLayer 的注释)——
+    ///   两层各自的淡出叠在一起时,到 50% 的瞬间合起来只有 25% 亮度,
+    ///   眼睛读到的就是"半天亮不起来"。一层 0.14s 比两层 0.2s 干净得多。
     private func presentWithFadeIn(_ win: NSWindow) {
         windowAnimationGeneration += 1
         let generation = windowAnimationGeneration
@@ -592,7 +663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
+            ctx.duration = AnimScale.s(0.14)
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             win.animator().alphaValue = 1
         } completionHandler: { [weak self] in
@@ -609,10 +680,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // ★ 2026-09-16:关窗不再直接 orderOut —— 那样整块界面是"啪"一下消失的。
-        //   改成先把窗口 alpha 淡到 0(0.2s),淡完再真正收进后台。
-        //   SwiftUI 那边同一时间在播"内容放大一点 + 淡出"(见 beginClose),
-        //   两边叠起来就是"合上"的感觉。
         //
+        //   关闭动画分成两半,各管一件事:
+        //     ① 内容层"微放大 + 一点点开合感" —— SwiftUI 那边听下面这条通知播
+        //        (见 AppGrid.swift 里 `.onReceive(...launchpadWillClose)`);
+        //     ② 整块屏幕"消失" —— 就是这里的 window alpha 淡出。
+        //   内容层**不再**做 opacity 淡出:两个淡出叠在一起 =
+        //   前 40% 时间里屏幕几乎没变化,看着就是"卡住不动然后突然没了"。
+        //
+        //   通知放在这里发,是为了覆盖**所有**关窗路径
+        //   (Esc / 点空白 / 点开 App / 失活),不用每处都写一遍。
+        NotificationCenter.default.post(name: .launchpadWillClose, object: nil)
+
         //   generation 用来防竞态:淡出还没跑完又按了快捷键要打开,
         //   老的 completionHandler 会晚一步把新显示的窗口收掉 ——
         //   所以每次开/关都 +1,回调里对不上号就直接放弃。
@@ -620,7 +699,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let generation = windowAnimationGeneration
 
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.20
+            // 0.20 → 0.14:用户实测关窗"拖沓"。0.14s 已经足够读成"淡出",
+            // 再长就只是等着了。
+            ctx.duration = AnimScale.s(0.14)
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             win.animator().alphaValue = 0
         } completionHandler: { [weak self] in

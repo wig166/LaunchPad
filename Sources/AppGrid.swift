@@ -1280,12 +1280,24 @@ struct LaunchpadRoot: View {
             backgroundLayer.probeFrame("背景层")
 
             contentLayer
-                // 打开:从 0.94 缩放到 1(比原来 0.9 更克制,配上下面的窗口淡入)
-                // 关闭:反向放大到 1.06 并淡出 —— 由 closing 驱动,见 beginClose()
-                .scaleEffect(closing ? 1.06 : (appeared ? 1.0 : 0.94))
-                .opacity(closing ? 0.0 : (appeared ? 1.0 : 0.0))
-                .animation(.spring(response: 0.42, dampingFraction: 0.82), value: appeared)
-                .animation(.easeIn(duration: 0.16), value: closing)
+                // ★ 2026-09-16 第二次调整:把"时长"砍下来,并且**只做一层淡出**。
+                //
+                //   上一版的问题(用户实测反馈"有点卡、时长有点长"):
+                //     ① 两个淡出叠在一起 —— 窗口 alpha 淡入 0.18s
+                //        + 内容 opacity 淡入 0.42s 弹簧。
+                //        两层各自到 50% 时,合起来才 25%,看着就是"半天亮不起来"。
+                //     ② 弹簧 response 0.42 的余振尾巴拖了很久,收尾黏。
+                //     ③ 缩放幅度 0.94↔1.06 太大,整块图标网格每帧都要按新尺寸重画。
+                //
+                //   现在:
+                //     · 内容**不再参与淡入**(opacity 恒为 1)—— 淡入只由窗口 alpha 做
+                //       (WindowServer 合成,零渲染开销),这样只有一层淡出,干净利落。
+                //     · 缩放幅度收到 0.97↔1.03,只留"一点点开合"的暗示。
+                //     · 弹簧 response 0.28/0.24、damping 0.9+,基本没有余振。
+                //     · 关闭时内容也不淡出 —— 整块屏幕一起 alpha 到 0 更像原生启动台。
+                .scaleEffect(closing ? 1.03 : (appeared ? 1.0 : 0.97))
+                .animation(AnimScale.spring(response: 0.28, dampingFraction: 0.9), value: appeared)
+                .animation(AnimScale.spring(response: 0.24, dampingFraction: 0.92), value: closing)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .probeFrame("根内容区")
@@ -1331,12 +1343,23 @@ struct LaunchpadRoot: View {
         //
         //   为什么必须复位:app 的窗口和 SwiftUI 视图是**常驻复用**的
         //   (main.swift openWindow 里"已有内容就只前置、不重建"),
-        //   上次关闭把 closing 留在 true,不复位的话下次打开就是一片透明、
-        //   而且缩放着 —— 看着像"启动台打不开了"。
-        //   复位本身带 0.16s 动画(下面挂了 .animation(value: closing)),
-        //   效果正好是"重新展开",顺带把入场也演一遍。
+        //   上次关闭把 closing 留在 true,不复位的话下次打开就是缩放着、
+        //   而且"合上"的动画状态还挂着。
+        //
+        //   ★ 复位**刻意不带动画**:此刻窗口 alpha 还是 0(淡入刚要开始),
+        //     让缩放瞬间回到 1.0 根本看不见;要是带动画,反而会先朝用户
+        //     演一遍"缩回去",跟"打开"的方向拧着。
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
-            if closing { closing = false }
+            guard closing else { return }
+            var noAnim = Transaction()
+            noAnim.disablesAnimations = true
+            withTransaction(noAnim) { closing = false }
+        }
+        // ★ 任何关窗路径(Esc / 点空白 / 点开 App / 失活)最终都会走到
+        //   main.swift 的 closeWindow(),它在那里统一发这条通知 ——
+        //   于是"合上"的内容动画就只有一个触发点,不用给每条路径各写一遍。
+        .onReceive(NotificationCenter.default.publisher(for: .launchpadWillClose)) { _ in
+            withAnimation(AnimScale.spring(response: 0.24, dampingFraction: 0.92)) { closing = true }
         }
     }
 
@@ -1410,75 +1433,91 @@ struct LaunchpadRoot: View {
 
     /// 内容层
     ///
-    /// ★ 2026-09-16:把"文件夹开/关"的动画**钉在容器上**(见下面的
-    ///   `.animation(_:value: activeFolderID)`)。
-    ///   之前只在 openFolder/closeFolder 里各写一个 `withAnimation`,
-    ///   结果是"进文件夹有动画、出文件夹像直接闪回去" ——
-    ///   因为返回顶层那一侧的 transition 原本只是 `.opacity`,
-    ///   而 withAnimation 只保证"改动被动画化",不保证两侧都有像样的过渡。
-    ///   现在:两侧 transition 都写全,再由容器上的 value 驱动,方向对称。
+    /// ★ 2026-09-16 修掉一个**上得很快、错得很明显**的改动:
+    ///
+    ///   上一版我把"进/出文件夹"的动画从 `withAnimation` 挪到了
+    ///   容器上的 `.animation(_:value: activeFolderID)`(挂在 `Group` 外面),
+    ///   想法是"一个地方驱动、两个方向对称"。结果用户实测:
+    ///   **文件夹的开合动画直接没了,一下切过去。**
+    ///
+    ///   原因是 `.animation(_:value:)` 挂在 `Group` 上时,它会**分发到每一个子视图**
+    ///   (Group 本身没有身份,不是真正的容器)。而"进文件夹"是**插入**一个新的
+    ///   FolderDetailView:这个新视图的 modifier 实例是刚建的,它没有"上一次的值"
+    ///   可比较,于是永远不会判定"值变了"→ 不会注入动画 →
+    ///   `.transition` 在没有动画的事务里执行 = 瞬间切换。
+    ///
+    ///   现在的做法(也是最稳的):**动画在改状态的那一行给**(见 openFolder/closeFolder
+    ///   里的 `withAnimation`)。`withAnimation` 是直接把动画写进当前 transaction,
+    ///   不依赖任何 modifier 的"值比较",插入/移除两侧都吃得到。
+    ///   两侧的 `.transition` 保留(那部分是上一版真正修对的东西:
+    ///   关闭时顶层网格从略大缩回来,不再是"文件夹一没、主界面直接在那儿了")。
     @ViewBuilder
     private var contentLayer: some View {
-        Group {
-            if scanComplete {
-                if let folder = activeFolder {
-                    FolderDetailView(
-                        folder: folder,
-                        onOpenApp: openApp,
-                        onMoveAppToTopLevel: moveAppToTopLevel,
-                        onReorderApps: { path, index in
-                            var s = structure
-                            s.moveAppInFolder(folderID: folder.id, appPath: path, to: index)
-                            structure = s
-                            LaunchpadStorage.save(s)
-                        },
-                        onRenameFolder: { id, name in
-                            var s = structure
-                            s.renameFolder(id: id, to: name)
-                            structure = s
-                            LaunchpadStorage.save(s)
-                        }
-                    )
-                    // 打开:从小长出来;关闭:放大一点再淡出(和原生启动台一个方向感)
-                    .transition(.asymmetric(
-                        insertion: .scale(scale: 0.4).combined(with: .opacity),
-                        removal: .scale(scale: 1.3).combined(with: .opacity)
-                    ))
-                    .zIndex(1)
-                } else {
-                    TopLevelView(
-                        structure: $structure,
-                        search: $search,
-                        onOpenApp: openApp,
-                        onOpenFolder: openFolder,
-                        onDeleteFolder: { id in
-                            var s = structure
-                            s.removeFolder(id: id)
-                            structure = s
-                            LaunchpadStorage.save(s)
-                        }
-                    )
-                    // 关闭文件夹时,顶层网格是"从略大缩回来" —— 补上这一侧,
-                    // 不然它只是淡入,看着就是"文件夹一没、主界面直接在那儿了"。
-                    .transition(.asymmetric(
-                        insertion: .scale(scale: 1.12).combined(with: .opacity),
-                        removal: .opacity
-                    ))
-                }
+        if scanComplete {
+            if let folder = activeFolder {
+                FolderDetailView(
+                    folder: folder,
+                    onOpenApp: openApp,
+                    onMoveAppToTopLevel: moveAppToTopLevel,
+                    onReorderApps: { path, index in
+                        var s = structure
+                        s.moveAppInFolder(folderID: folder.id, appPath: path, to: index)
+                        structure = s
+                        LaunchpadStorage.save(s)
+                    },
+                    onRenameFolder: { id, name in
+                        var s = structure
+                        s.renameFolder(id: id, to: name)
+                        structure = s
+                        LaunchpadStorage.save(s)
+                    }
+                )
+                // 打开:从小长出来;关闭:放大一点再淡出(和原生启动台一个方向感)
+                .transition(.asymmetric(
+                    insertion: .scale(scale: 0.45).combined(with: .opacity),
+                    removal: .scale(scale: 1.25).combined(with: .opacity)
+                ))
+                .zIndex(1)
             } else {
-                VStack(spacing: 14) {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                        .scaleEffect(1.4)
-                    Text("正在载入 App…")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.white.opacity(0.8))
-                }
-                .transition(.opacity)
+                TopLevelView(
+                    structure: $structure,
+                    search: $search,
+                    onOpenApp: openApp,
+                    onOpenFolder: openFolder,
+                    onDeleteFolder: { id in
+                        var s = structure
+                        s.removeFolder(id: id)
+                        structure = s
+                        LaunchpadStorage.save(s)
+                    }
+                )
+                // 关闭文件夹时,顶层网格是"从略大缩回来" —— 补上这一侧,
+                // 不然它只是淡入,看着就是"文件夹一没、主界面直接在那儿了"。
+                //
+                // ★ 缩放只给 1.06(原 1.12):这一侧**冷启动时也会走**
+                //   (scanComplete 翻真,顶层网格首次插入),幅度太大就会让
+                //   整块图标网格在"图标还在后台烤"的同一时刻按新尺寸重画 → 卡。
+                //
+                // ★ 曾经试过把两侧都改成纯 `.opacity`(想借它消掉卡顿),
+                //   实测**没用**:文件夹开合时的主线程停顿(50~150ms)照旧,
+                //   它是 SwiftUI 构建/布局新视图树的一次性开销,不是缩放给的。
+                //   既然省不掉,就把缩放留下 —— 那是"开合感"的来源。
+                .transition(.asymmetric(
+                    insertion: .scale(scale: 1.06).combined(with: .opacity),
+                    removal: .opacity
+                ))
             }
+        } else {
+            VStack(spacing: 14) {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    .scaleEffect(1.4)
+                Text("正在载入 App…")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+            .transition(.opacity)
         }
-        // ★ 开/关文件夹的动画由这一行统一驱动,两个方向都走同一条弹簧。
-        .animation(.spring(response: 0.45, dampingFraction: 0.82), value: activeFolderID)
     }
 
     private func loadAndScan() {
@@ -1489,11 +1528,99 @@ struct LaunchpadRoot: View {
                 var s = saved
                 s.merge(with: scanned)
                 structure = s
-                withAnimation(.easeIn(duration: 0.25)) {
+                // 入场淡入从 easeIn 0.25 改成 easeOut 0.18:
+                //   easeIn 是"慢起快收",用在做入场最别扭 —— 开头那一段几乎不动,
+                //   观众读到的就是"卡了一下才出来"。easeOut 才是正常的入场曲线。
+                withAnimation(.easeOut(duration: 0.18)) {
                     scanComplete = true
                 }
-                preloadIcons(for: s)
+                // ★ 图标预热**推迟到入场动画之后**。
+                //
+                //   IconCache.preloadCards 内部走的是
+                //   `concurrentPerform(iterations: paths.count)` —— 一次把所有核心
+                //   都占满去烤 78pt 图标卡片。以前它跟"窗口淡入 + 网格缩放进场"
+                //   撞在同一个瞬间(scanComplete 一翻真就立刻调),
+                //   8GB 的 M1 上主线程抢不到核,动画就掉帧 —— 用户说的"有点卡"。
+                //   顺手把这段挪后 0.35s,让入场先跑完,再开始烤图标。
+                //   代价:首屏可见的那十来个图标会走"按需加载"(本来就是异步的),
+                //   滚动手感不受影响 —— 滚动时缓存里早就有了。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    preloadIcons(for: s)
+                }
                 applyProbeIfNeeded(s)
+                runAnimationSelfTestIfNeeded(s)
+            }
+        }
+    }
+
+    /// 动画自测。正常启动是**空操作**。
+    ///
+    /// ## 为什么要有它
+    ///
+    /// "过渡到底有没有真的在播"这件事,在 300ms 里靠肉眼是**判断不了**的。
+    /// 上一版(2026-09-16 第一次改动画)就是:代码里明明写了 `.transition`,
+    /// 但驱动它的 `.animation(_:value:)` 挂 `Group` 上被吃掉了,
+    /// 实际效果是"啪一下切过去"。我自己看不出来,用户一装就说"动画没了"。
+    ///
+    /// 所以留一套**能被机器验证**的自测:app 自己把动画演一遍并在
+    /// diagnostic.log 打点,外面用抓帧工具连续抓屏、算逐帧像素差 ——
+    ///   静态       → diff≈0
+    ///   过渡真在播 → 连续十几帧 diff 明显 >0
+    ///   被吃掉     → **只有 1 帧**大,紧接着立刻回 0
+    /// 两者一比,骗不了人。
+    ///
+    /// ## 用法(仅调试,正常启动没有任何影响)
+    ///
+    ///     LP_ANIMTEST=folder LP_ANIMSCALE=4  ./LaunchPad   # 只测文件夹开合
+    ///     LP_ANIMTEST=window LP_ANIMSCALE=4  ./LaunchPad   # 只测整窗开合
+    ///     LP_ANIMTEST=all    LP_ANIMSCALE=4  ./LaunchPad   # 全测
+    ///
+    /// 两种模式**必须分开跑**是为消歧义:一次只发生一类动画,
+    /// 那么抓到的每一段变化就一定属于那一类,不会互相顶替。
+    private func runAnimationSelfTestIfNeeded(_ s: LaunchpadStructure) {
+        let mode = ProcessInfo.processInfo.environment["LP_ANIMTEST"] ?? ""
+        guard ["folder", "window", "all", "1"].contains(mode) else { return }
+
+        let folders: [FolderItem] = s.topLevel.compactMap {
+            if case .folder(let f) = $0 { return f } else { return nil }
+        }
+        guard let target = folders.first(where: { !$0.apps.isEmpty }) ?? folders.first else {
+            Diag.log("动画自测:没有文件夹,跳过")
+            return
+        }
+
+        // 一步的"周期" = 动画时长 + 静止段。静止段是抓帧分析时的对照基线。
+        let gap = 1.2
+        let folderCycle = AnimScale.s(0.32) + gap
+        let winCycle    = AnimScale.s(0.14) + gap
+
+        var steps: [(String, Double, () -> Void)] = []
+        var t = 1.0
+        func add(_ label: String, _ act: @escaping () -> Void, _ span: Double) {
+            steps.append((label, t, act)); t += span
+        }
+
+        if mode != "window" {
+            add("进文件夹 #1", { self.openFolder(id: target.id) }, folderCycle)
+            add("出文件夹 #1", { self.closeFolder() },             folderCycle)
+            add("进文件夹 #2", { self.openFolder(id: target.id) }, folderCycle)
+            add("出文件夹 #2", { self.closeFolder() },             folderCycle)
+        }
+        if mode != "folder" {
+            add("收起整个窗口", {
+                NotificationCenter.default.post(name: .launchpadDebugClose, object: nil)
+            }, winCycle)
+            add("重新打开窗口", {
+                NotificationCenter.default.post(name: .launchpadDebugOpen, object: nil)
+            }, winCycle)
+        }
+        steps.append(("测试结束", t, { Diag.log("动画自测:结束") }))
+
+        Diag.log("动画自测:开始 模式=\(mode) 文件夹「\(target.name)」时长倍数 \(AnimScale.factor) 共 \(steps.count) 步")
+        for (label, at, act) in steps {
+            DispatchQueue.main.asyncAfter(deadline: .now() + at) {
+                Diag.log(String(format: "动画自测[%.2fs] %@", at, label))
+                act()
             }
         }
     }
@@ -1563,28 +1690,30 @@ struct LaunchpadRoot: View {
         beginClose()
     }
 
+    /// ★★ 动画必须在**改状态这一行**给 —— 原因见 contentLayer 上面那段长注释。
+    ///    这两条弹簧本来只有 0.48 / 0.40,用户实测"有点卡、时长有点长",
+    ///    现在收到 0.32 / 0.30,并把缩放的起止幅度收窄(0.45 / 1.25)。
     private func openFolder(id: String) {
-        activeFolderID = id
+        withAnimation(AnimScale.spring(response: 0.32, dampingFraction: 0.86)) {
+            activeFolderID = id
+        }
     }
 
     private func closeFolder() {
-        activeFolderID = nil
+        withAnimation(AnimScale.spring(response: 0.30, dampingFraction: 0.88)) {
+            activeFolderID = nil
+        }
     }
 
-    /// 关掉整个启动台:**先播"合上"动画,再真正收窗**。
+    /// 关掉整个启动台。
     ///
-    /// 为什么要在这里插一段、而不是直接调 onEscape():
-    ///   onEscape() 一路走到 main.swift 的 closeWindow() → `orderOut`,
-    ///   窗口是**瞬间**消失的 —— 就是用户说的"一下就没了,很唐突"。
-    ///   现在改成:先让内容缩一下淡出(0.16s),动画播完再收窗;
-    ///   窗口那边同时还会做一个 0.2s 的 alpha 淡出(见 main.swift closeWindow)。
-    ///
-    /// closing 这个 flag 兼作"防重入":连点两下空白、或者点空白的同时按 Esc,
-    /// 只会走一次关闭流程,不会叠加两个定时器。
+    /// 这里**只负责"不能重入"**,"合上"的动画由 main.swift 的 closeWindow()
+    /// 发 `.launchpadWillClose` 通知、LaunchpadRoot 统一播(见 body 里的 onReceive)。
+    /// 为什么不在这里 withAnimation:这里有 `guard !closing` 但关闭路径不止这一条
+    /// (Esc、失活、点开 App 都直接走 closeWindow),动画挂在通知上才覆盖得全。
     private func beginClose() {
         guard !closing else { return }
-        withAnimation(.easeIn(duration: 0.16)) { closing = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { onEscape() }
+        onEscape()
     }
 
     /// 把 app 从文件夹里拖出来、放回顶层网格(紧跟在文件夹后面一格)
