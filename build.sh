@@ -57,6 +57,15 @@ codesign --force --sign - \
   --entitlements Sources/LaunchPad.entitlements \
   "$APP"
 
+# ★ 签名**之后**再清一次。
+#   2026-09-16 又踩到:codesign 自己会在 Contents/MacOS 里留一个
+#   LaunchPad.cstemp(它写临时文件再改名,改名留下的残骸不会自己消失)。
+#   签名时它还不存在,所以签名前的清理管不到它,自检当时也是"valid";
+#   等下次再校验就变成 "code has no resources but signature indicates
+#   they must be present" —— 别人下载后又是"文件已损坏"。
+#   所以前后各清一次,别省这一步。
+find "$APP" -name "*.cstemp" -delete 2>/dev/null || true
+
 echo "==> 签名自检(密封清单里不能出现 .cstemp 残留)"
 if ! codesign -vv --strict "$APP" 2>&1 | tail -2; then
   echo "❌ 签名无效,中止"
