@@ -150,19 +150,6 @@ enum WallpaperBackground {
         return CGFloat(max(0, min(40, UserDefaults.standard.double(forKey: "wallpaper.blurRadius"))))
     }
 
-    /// 开合动画用的"远景档":比用户设定的**再糊一档**。
-    ///
-    /// 开窗时背景从这一档"对焦"到用户那一档,观感就是从磨砂玻璃后面浮出来。
-    ///
-    /// 为什么是"两档交叉淡入"而不是"每帧改模糊半径":
-    ///   480px 图做一次高斯模糊 CPU 约 11ms。60fps 一帧只有 16.7ms 预算,
-    ///   每帧重算根本塞不下(这正是当初放弃 NSVisualEffectView 的原因)。
-    ///   预渲染两档、用 opacity 交叉淡入,每帧只做合成 —— 视觉上等价,成本接近于零。
-    ///
-    /// 为什么是 +22:用户设 16 时远景区是 38,差异足够明显;
-    /// 用户已经拉到 40(最糊)时两档重合,对焦效果自然消失 —— 合理,他已经选了"全程糊"。
-    static var farBlurRadius: CGFloat { min(40, userBlurRadius + 22) }
-
     /// 取某块屏幕壁纸的模糊版。取不到返回 nil,调用方自行回退。
     ///
     /// - Parameters:
