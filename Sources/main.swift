@@ -297,6 +297,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var escMonitor: Any?
     private var hotKeyRef: EventHotKeyRef?
 
+    /// 开/关窗口动画的代数号 —— 只用来防竞态,不参与渲染。
+    /// 见 presentWithFadeIn / closeWindow 里对 completionHandler 的说明。
+    private var windowAnimationGeneration = 0
+
     /// 截图流程的"宽限期" —— 一旦看到截图相关进程被激活,这段时间内
     /// 不再把失活当成"用户切走了"。
     private var screenshotGraceUntil: Date?
@@ -502,8 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 已有窗口且有内容 → 只前置,不重建内容(保留搜索/编辑模式/文件夹状态)
         if let existing = window, existing.contentViewController != nil {
-            existing.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            presentWithFadeIn(existing)
             return
         }
 
@@ -549,8 +552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """)
         }
         ensureEscMonitor()
-        win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        presentWithFadeIn(win)
 
         // 帧探针要挂在真实的视图上 —— 用 hosting 的 view,不是 contentView,
         // 这样量和刷新同步的正是"真正在画内容的那个视图"。
@@ -575,9 +577,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 显示窗口并淡入(0.18s)。
+    ///
+    /// 为什么要淡入而不是直接 makeKeyAndOrderFront:
+    ///   窗口是不透明的、铺满整屏,直接显示就是"啪"地糊一屏,很唐突。
+    ///   先把 alpha 设 0 再动画到 1,配合 SwiftUI 那边的内容缩放,
+    ///   整体就是"打开"的手感(和关闭时的淡出对称)。
+    private func presentWithFadeIn(_ win: NSWindow) {
+        windowAnimationGeneration += 1
+        let generation = windowAnimationGeneration
+
+        win.alphaValue = 0
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            win.animator().alphaValue = 1
+        } completionHandler: { [weak self] in
+            guard let self, self.windowAnimationGeneration == generation else { return }
+            self.window?.alphaValue = 1
+        }
+    }
+
     func closeWindow(reason: String = "未说明") {
         Diag.log("关窗 (原因: \(reason))")
-        window?.orderOut(nil)
+        guard let win = window, win.isVisible else {
+            window?.orderOut(nil)
+            return
+        }
+
+        // ★ 2026-09-16:关窗不再直接 orderOut —— 那样整块界面是"啪"一下消失的。
+        //   改成先把窗口 alpha 淡到 0(0.2s),淡完再真正收进后台。
+        //   SwiftUI 那边同一时间在播"内容放大一点 + 淡出"(见 beginClose),
+        //   两边叠起来就是"合上"的感觉。
+        //
+        //   generation 用来防竞态:淡出还没跑完又按了快捷键要打开,
+        //   老的 completionHandler 会晚一步把新显示的窗口收掉 ——
+        //   所以每次开/关都 +1,回调里对不上号就直接放弃。
+        windowAnimationGeneration += 1
+        let generation = windowAnimationGeneration
+
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.20
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            win.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self, self.windowAnimationGeneration == generation else { return }
+            self.window?.orderOut(nil)
+            self.window?.alphaValue = 1      // 复位,供下次淡入使用
+        }
     }
 
     /// ★ 别的 App 抢到前台 → 我们收起
