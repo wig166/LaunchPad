@@ -41,10 +41,27 @@ if [ -f Sources/AppIcon.icns ]; then
 fi
 
 echo "==> 重新签名(ad-hoc,固定 identifier)"
-codesign --force --deep --sign - \
+# ★ 签名前必须清掉旧的 _CodeSignature。
+#   原因(2026-09-16 踩坑):codesign 会先把包内文件清单写进 CodeResources,
+#   如果上一轮的密封清单还在,它会把上次签名留下的临时文件引用
+#   (MacOS/LaunchPad.cstemp)当成"包内资源"一并封进新签名。
+#   结果:签名在 codesign -vv 下报 "a sealed resource is missing or invalid",
+#   别人下载后 Gatekeeper 直接判「文件已损坏」,右键打开都救不回来。
+#   —— 那天的 v1.12 首发包就是这么坏的。
+# ★ 另外不要用 --deep:包内没有嵌套的 framework/插件,--deep 反而容易
+#   在签名过程中生成 .cstemp 临时文件并被封进资源清单。
+rm -rf "$APP/Contents/_CodeSignature"
+find "$APP" -name "*.cstemp" -delete 2>/dev/null || true
+codesign --force --sign - \
   --identifier com.xingxing.launchpad \
   --entitlements Sources/LaunchPad.entitlements \
   "$APP"
+
+echo "==> 签名自检(密封清单里不能出现 .cstemp 残留)"
+if ! codesign -vv --strict "$APP" 2>&1 | tail -2; then
+  echo "❌ 签名无效,中止"
+  exit 1
+fi
 
 echo "==> 重新注册到 LaunchServices"
 LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
