@@ -29,26 +29,48 @@ echo "==> 选择可用的 SDK"
 #   26.5 的 SwiftUICore 里 State 还是普通的 @propertyWrapper,不需要插件。
 #   判据可以直接查接口文件里有没有 `macro State()`,不用试编译。
 #
+#   ★ 2026-09-20 更新:本机已装完整 Xcode 27,这个坑就不存在了 ——
+#   插件在**平台目录**(不是工具链目录,找错地方会误判成"Xcode 也没有"):
+#       Xcode.app/Contents/Developer/Platforms/MacOSX.platform/
+#           Developer/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib
+#   所以下面的逻辑改成:**有 Xcode 就优先用它的最新 SDK**,原来那套
+#   "扫描 CLT 的 SDK、跳过带 macro 的" 只作为"只有 CLT"时的兜底保留。
+#
 #   顺带把最低系统版本写成**显式**的(见下面的 -target):
 #   不加的话,编译器的默认目标会跟着**宿主系统**走 —— 升级工具链后
 #   minos 会悄悄涨到 27.0,别人下载了在旧系统上直接打不开。
 #   之前旧工具链生成的包 minos 是 18.0(macOS 15 的机器会被拒),
 #   所以这一步同时是在修一个已经发出去的包的兼容性问题。
 SDK=""
-for cand in /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk; do
-  [ -L "$cand" ] && continue                       # 跳过 MacOSX.sdk 这类软链
-  iface=$(ls "$cand"/System/Library/Frameworks/SwiftUICore.framework/Modules/SwiftUICore.swiftmodule/*.swiftinterface 2>/dev/null | head -1)
-  [ -z "$iface" ] && continue
-  if /usr/bin/grep -q 'macro State()' "$iface" 2>/dev/null; then
-    continue                                       # @State 是宏 → CLT 展不开,不能用
-  fi
-  if [ -z "$SDK" ] || [ "$cand" \> "$SDK" ]; then SDK="$cand"; fi
-done
+
+# ★★ 第一优先:完整 Xcode。平台目录里有 SwiftUI 宏插件 → 用它的最新 SDK。
+#    比起"扫 CLT 的 SDK 再一个个排除",这条路是正解:CLT 那套扫描本质是在绕
+#    一个只有 CLT 才有的缺陷,装了 Xcode 就没必要再绕。
+DEV="$(xcode-select -p 2>/dev/null || true)"
+XCODE_PLUGINS="$DEV/Platforms/MacOSX.platform/Developer/usr/lib/swift/host/plugins"
+if [ -n "$DEV" ] && [ -f "$XCODE_PLUGINS/libSwiftUIMacros.dylib" ]; then
+  SDK="$(xcrun --show-sdk-path)"
+  SDK_SRC="完整 Xcode(宏插件齐全)"
+fi
+
+# ★★ 兜底:只有 Command Line Tools 时,挑"还没把 @State 变成宏"的最新 SDK。
+if [ -z "$SDK" ]; then
+  for cand in /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk; do
+    [ -L "$cand" ] && continue                     # 跳过 MacOSX.sdk 这类软链
+    iface=$(ls "$cand"/System/Library/Frameworks/SwiftUICore.framework/Modules/SwiftUICore.swiftmodule/*.swiftinterface 2>/dev/null | head -1)
+    [ -z "$iface" ] && continue
+    if /usr/bin/grep -q 'macro State()' "$iface" 2>/dev/null; then
+      continue                                     # @State 是宏 → CLT 展不开,不能用
+    fi
+    if [ -z "$SDK" ] || [ "$cand" \> "$SDK" ]; then SDK="$cand"; fi
+  done
+  [ -n "$SDK" ] && SDK_SRC="只有命令行工具(已跳过把 @State 变成宏的 SDK)"
+fi
 
 if [ -z "$SDK" ]; then
   echo "❌ 找不到可用的 SDK:所有已装 SDK 的 SwiftUI 都把 @State 定义成了宏,"
-  echo "   而命令行工具里没有对应的宏插件(只有完整 Xcode 才带)。"
-  echo "   两种走法:① 装完整 Xcode;② 装回带旧 SDK 的命令行工具。"
+  echo "   而命令行工具里没有对应的宏插件。"
+  echo "   两种走法:① 装完整 Xcode(推荐,插件在平台目录);② 装回带旧 SDK 的命令行工具。"
   exit 1
 fi
 
@@ -57,17 +79,23 @@ fi
 MACOS_MIN="15.0"
 ARCH="$(uname -m)"
 echo "    SDK: $SDK"
+echo "    来源: ${SDK_SRC:-未知}"
 echo "    最低系统: macOS $MACOS_MIN"
 
 echo "==> 编译 Swift 源码"
-# 注意两点:
+# 注意三点:
 #  1. 之前这里写的是"不要加 -target,会触发一堆 only available in macOS 14.0 的误报"。
 #     那是**旧工具链**下的经验:当时宿主 SDK 是 15.5,代码里用了 macOS 14 的
 #     两参数 onChange,目标写得比 SDK 老就会报一堆可用性错误。
-#     现在固定用 26.5 的 SDK、目标 15.0(SDK 比目标新是正常方向),
-#     这类报错不会出现 —— 实测全项目只剩 1 条 onChange 废弃警告。
+#     现在固定"目标 15.0 + 比目标新的 SDK"(正常方向),这类报错不会出现 ——
+#     实测 SDK 26.5 与 SDK 27 各编一遍,都是 0 警告。
 #  2. 链 Carbon 而不是 ApplicationServices —— 全局快捷键已经改用
 #     registerEventHotKey,不再需要辅助功能权限(见 Sources/main.swift 注释)。
+#  3. -disable-sandbox:swiftc 默认会给自己拉起的宏插件子进程(swift-plugin-server)
+#     再套一层 sandbox。在**已经是沙箱**的宿主里(WorkBuddy/CI)这一层套不上,
+#     报出来的是误导性的 "SwiftUIMacros.StateMacro could not be found ...
+#     produced malformed response"(真正的错在最上面一行 sandbox_apply)。
+#     插件是 Xcode 自带的,关掉这层没有实际风险;普通终端加不加都一样。
 xcrun swiftc \
   Sources/AppScanner.swift \
   Sources/LaunchpadModel.swift \
@@ -81,6 +109,7 @@ xcrun swiftc \
   -framework Carbon \
   -sdk "$SDK" \
   -target "${ARCH}-apple-macosx${MACOS_MIN}" \
+  -disable-sandbox \
   -O
 
 echo "==> 拷贝 Info.plist"

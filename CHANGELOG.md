@@ -265,5 +265,74 @@ Command Line Tools 只带了 `libSwiftMacros` / `libObservationMacros` / `libTes
 
 ---
 
+## v1.14 (build 24) —— 2026-09-20
+
+### 起因
+
+我给这台机器装了完整的 Xcode。本来只是想着以后查性能要用 Instruments,
+装完顺手试了一下 —— 结果之前折腾了我半天的那个编译问题,自己没了。
+
+### 之前卡在哪
+
+升到 Command Line Tools 27 之后项目突然编不过,`@State` 全线报错,一共 220 条。
+根因只有一个:SDK 27 把 `@State` 从属性包装器改成了**宏**,宏要靠插件
+`libSwiftUIMacros.dylib` 展开,而命令行工具里**没有**这个插件。
+
+当时的绕法是:挑一个"还没把 `@State` 变成宏"的老 SDK(26.5)来编。
+能用,但本质是在绕一个**只有命令行工具才有的缺陷**。
+
+### 我误判了一次
+
+确认 Xcode 到底带不带这个插件时,我用
+`find /Applications/Xcode.app -name "*SwiftUIMacros*"` 搜。跑了两回都是空,
+于是我很笃定地得出了"连完整 Xcode 都没有"的结论。
+
+结果是我搜错了地方。`find` 在 Xcode 那个体积下**90 秒都跑不完**,被超时掐掉后
+**静默返回空** —— 看起来和"不存在"一模一样。插件其实好好地躺在**平台目录**里:
+
+```
+Xcode.app/Contents/Developer/Platforms/MacOSX.platform/
+  Developer/usr/lib/swift/host/plugins/libSwiftUIMacros.dylib
+```
+
+而我一直在翻的是**工具链目录**(`XcodeDefault.xctoolchain/...`),
+那里只有 SwiftMacros / ObservationMacros / PlaygroundMacros。
+
+记下来:**别用 find 搜 Xcode,直接 ls 确定路径**;实在不确定就编个三行文件试一下,
+比翻文件又快又准。
+
+### 这次的改动
+
+`build.sh` 里的 SDK 选择改成两步:
+
+1. **有完整 Xcode → 直接用它的最新 SDK**(判据是平台目录里有没有那个宏插件)。
+2. 只有命令行工具 → 还是老办法,跳过把 `@State` 变成宏的 SDK。
+
+另外加了 `-disable-sandbox`。这个是给"在沙箱环境里编译"用的:编译器默认会给自己
+拉起的宏插件子进程再套一层 sandbox,宿主本身已经是沙箱时这层套不上,
+而它报出来的错**极具误导性** —— 会说 `StateMacro could not be found ... malformed response`,
+真正的错(`sandbox_apply: Operation not permitted`)挤在最上面一行,很容易看漏。
+我自己就被这个绕了一轮。普通终端里加不加都一样。
+
+### 实测
+
+| | build 23 | build 24 |
+|---|---|---|
+| SDK | 命令行工具 26.5 | Xcode 27.0 |
+| 二进制里的 `sdk` 字段 | 27.0(驱动用的默认值) | 27.0(真的就是它) |
+| 编译耗时 | — | 约 11 秒 |
+| 警告 | 0 条 | 0 条 |
+| `minos` | 15.0 | 15.0 |
+
+`minos` 仍然钉死在 15.0,老系统上照样能开。
+
+### 顺带
+
+这台机器现在多了 `xcrun xctrace`(Instruments 的命令行)和 lldb。
+那个从 9/16 就挂着的"进出文件夹停顿 80~130ms" —— 之前我只能量出**停了多久**,
+量不出**花在哪** —— 现在有工具能直接看调用栈了。下一版就查这个。
+
+---
+
 **创作者-星之所向-阿星陪你走过丝绸之路**
 一个骑行的人,顺手写的 Mac 小工具。
