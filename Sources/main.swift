@@ -581,6 +581,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 已有窗口且有内容 → 只前置,不重建内容(保留搜索/编辑模式/文件夹状态)
         if let existing = window, existing.contentViewController != nil {
             presentWithFadeIn(existing)
+            // ★★ 2026-09-20 修的 bug:这条分支以前直接 return,把函数末尾那条
+            //    `launchpadDidOpen` 通知整个绕过去了。
+            //
+            //    后果(张张报的"启动台壁纸和桌面又不一样了"):
+            //    窗口和视图是**常驻复用**的 —— 关窗只是把窗口藏起来。
+            //    于是"已有内容"这条分支是**除进程第一次开窗以外的每一次**都会走的,
+            //    那条通知就只在冷启动时发过一次。冷启动由 .onAppear 兜住了,
+            //    所以表现是:刚启动/重建后是准的,此后桌面每换一张,启动台永远不跟。
+            //
+            //    实测对照:完全重启 app 开窗 → 日志有"壁纸: 采用 xxx"(选对了);
+            //             窗口已在、再开一次 → 日志一条都没有(根本没重算)。
+            //
+            //    ★ 注意别把通知提到函数最上面去"统一处理":第一次开窗时
+            //      SwiftUI 视图还没被创建,那时候发出去没人收,反而会把冷启动弄坏。
+            NotificationCenter.default.post(name: .launchpadDidOpen, object: nil)
             return
         }
 
